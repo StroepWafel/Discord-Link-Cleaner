@@ -109,7 +109,7 @@ sudo apt install python3 python3-pip python3-venv -y
 If you're using Git:
 
 ```bash
-git clone https://github.com/your-username/Discord-Link-Cleaner
+git clone https://github.com/StroepWafel/Discord-Link-Cleaner
 cd Discord-Link-Cleaner
 ```
 
