@@ -2,6 +2,8 @@
 
 import json
 import discord
+from discord import app_commands
+from discord.ext import commands
 import re
 from datetime import datetime
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
@@ -158,12 +160,12 @@ ensure_json_valid(CONFIG_PATH, default_config)
 ensure_file_exists(TRACKERS_PATH, default_trackers)
 ensure_json_valid(TRACKERS_PATH, default_trackers)
 
+# Load initial config
 with open(CONFIG_PATH, 'r', encoding="utf-8") as f:
     config = json.load(f)
 
 with open(TRACKERS_PATH, 'r', encoding="utf-8") as f:
     trackers = json.load(f)
-
 
 bot_token = config.get("bot_token", default_config["bot_token"])
 mention_reply_author = config.get("mention_reply_author", default_config["mention_reply_author"])
@@ -241,60 +243,396 @@ def format_companies(companies):
         return companies[0]
     else:
         return ", ".join(companies[:-1]) + f", and {companies[-1]}"
+
+def load_config():
+    """Load configuration from JSON file."""
+    global config, mention_reply_author, require_links, REGEX
+    with open(CONFIG_PATH, 'r', encoding="utf-8") as f:
+        config = json.load(f)
+    
+    mention_reply_author = config.get("mention_reply_author", default_config["mention_reply_author"])
+    require_links = config.get("require_links", default_config["require_links"])
+    
+    try:
+        REGEX = re.compile(config.get("regex_keys", default_config["regex_keys"]))
+    except re.error as e:
+        raise RuntimeError(f"Invalid regex in config.json: {e}")
+
+def save_config():
+    """Save current configuration to JSON file."""
+    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=4)
+
+def load_trackers():
+    """Load trackers from JSON file."""
+    global trackers, PARAM_INDEX
+    with open(TRACKERS_PATH, 'r', encoding="utf-8") as f:
+        trackers = json.load(f)
+    PARAM_INDEX = {param.lower(): company for company, params in trackers.items() for param in params}
+
+def save_trackers():
+    """Save current trackers to JSON file."""
+    with open(TRACKERS_PATH, 'w', encoding='utf-8') as f:
+        json.dump(trackers, f, indent=4)
 #--------------------------------------------------------------------
 # Main Program
 #--------------------------------------------------------------------
 
-class DiscordClient(discord.Client):
-    async def on_ready(self):
-        print(f'Logged in as {self.user}!')
-
-    async def on_message(self, message):
-        if message.author == self.user:
-            return  
-
-        if not (has_link(message.content) and require_links):
-            return  
-
-        urls = re.findall(REGEX, message.content)
-        if not urls:
-            return
-
-        detected_companies = set()
-        sanitized_map = {}  
-
-        for url in urls:
-            result = clean_url(url)
-            if result["removed_trackers"]:
-                detected_companies.update(result["removed_trackers"].keys())
-                sanitized_map[url] = result["clean_url"]
-
-        if detected_companies:
-            try:
-                reply = await message.reply(">>>")
-                await message.delete()
-                sanitized_message = message.content
-                for original, cleaned in sanitized_map.items():
-                    sanitized_message = sanitized_message.replace(original, cleaned)
-
-                notice = (
-                    f"{message.author.mention} Your message has been reposted without trackers from "
-                    f"{format_companies(detected_companies)}:"
-                )
-
-                await reply.edit(content=f"{notice}\n{sanitized_message}")
-            
-            
-
-            except discord.Forbidden:
-                print("Bot lacks permission to delete messages.")
-            except Exception as e:
-                print(f"Error handling message: {e}")
-
-
-
 intents = discord.Intents.default()
 intents.message_content = True
 
-discord.client = DiscordClient(intents=intents)
-discord.client.run(bot_token)
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user}!')
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} command(s)")
+    except Exception as e:
+        print(f"Failed to sync commands: {e}")
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+    
+    # Process commands first
+    await bot.process_commands(message)
+    
+    if not (has_link(message.content) and require_links):
+        return  
+
+    urls = re.findall(REGEX, message.content)
+    if not urls:
+        return
+
+    detected_companies = set()
+    sanitized_map = {}  
+
+    for url in urls:
+        result = clean_url(url)
+        if result["removed_trackers"]:
+            detected_companies.update(result["removed_trackers"].keys())
+            sanitized_map[url] = result["clean_url"]
+
+    if detected_companies:
+        try:
+            reply = await message.reply(">>>")
+            await message.delete()
+            sanitized_message = message.content
+            for original, cleaned in sanitized_map.items():
+                sanitized_message = sanitized_message.replace(original, cleaned)
+
+            # Use mention_reply_author setting
+            author_mention = f"{message.author.mention} " if mention_reply_author else ""
+            notice = (
+                f"{author_mention}Your message has been reposted without trackers from "
+                f"{format_companies(detected_companies)}:"
+            )
+
+            await reply.edit(content=f"{notice}\n{sanitized_message}")
+        
+        except discord.Forbidden:
+            print("Bot lacks permission to delete messages.")
+        except Exception as e:
+            print(f"Error handling message: {e}")
+
+#--------------------------------------------------------------------
+# Admin Commands
+#--------------------------------------------------------------------
+
+def is_admin(interaction: discord.Interaction) -> bool:
+    """Check if user has administrator permissions."""
+    return interaction.user.guild_permissions.administrator
+
+@bot.tree.command(name="settings", description="View current bot settings")
+async def settings(interaction: discord.Interaction):
+    """View current bot settings."""
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You need administrator permissions to use this command.", ephemeral=True)
+        return
+    
+    load_config()
+    embed = discord.Embed(
+        title="Bot Settings",
+        color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="Mention Reply Author",
+        value="✅ Enabled" if mention_reply_author else "❌ Disabled",
+        inline=False
+    )
+    embed.add_field(
+        name="Require Links",
+        value="✅ Enabled" if require_links else "❌ Disabled",
+        inline=False
+    )
+    embed.add_field(
+        name="Regex Pattern",
+        value=f"`{config.get('regex_keys', 'N/A')[:100]}...`" if len(config.get('regex_keys', '')) > 100 else f"`{config.get('regex_keys', 'N/A')}`",
+        inline=False
+    )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="set_mention", description="Enable or disable mentioning the author when reposting messages")
+@app_commands.describe(enabled="Whether to mention the author when reposting")
+async def set_mention(interaction: discord.Interaction, enabled: bool):
+    """Set whether to mention the author when reposting messages."""
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You need administrator permissions to use this command.", ephemeral=True)
+        return
+    
+    global mention_reply_author
+    config["mention_reply_author"] = enabled
+    save_config()
+    load_config()
+    
+    await interaction.response.send_message(
+        f"✅ Mention reply author has been {'enabled' if enabled else 'disabled'}.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="set_require_links", description="Enable or disable requiring links in messages before processing")
+@app_commands.describe(enabled="Whether to only process messages that contain links")
+async def set_require_links(interaction: discord.Interaction, enabled: bool):
+    """Set whether to require links in messages before processing."""
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You need administrator permissions to use this command.", ephemeral=True)
+        return
+    
+    global require_links
+    config["require_links"] = enabled
+    save_config()
+    load_config()
+    
+    await interaction.response.send_message(
+        f"✅ Require links has been {'enabled' if enabled else 'disabled'}.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="set_regex", description="Set the regex pattern used to detect URLs")
+@app_commands.describe(pattern="The regex pattern to use for URL detection")
+async def set_regex(interaction: discord.Interaction, pattern: str):
+    """Set the regex pattern used to detect URLs."""
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You need administrator permissions to use this command.", ephemeral=True)
+        return
+    
+    # Validate regex pattern
+    try:
+        test_regex = re.compile(pattern)
+    except re.error as e:
+        await interaction.response.send_message(
+            f"❌ Invalid regex pattern: {e}\n\nPlease provide a valid regex pattern.",
+            ephemeral=True
+        )
+        return
+    
+    global REGEX
+    config["regex_keys"] = pattern
+    save_config()
+    load_config()
+    
+    await interaction.response.send_message(
+        f"✅ Regex pattern has been updated.\n\nNew pattern: `{pattern}`",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="reload_config", description="Reload configuration from file")
+async def reload_config(interaction: discord.Interaction):
+    """Reload configuration from config.json file."""
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You need administrator permissions to use this command.", ephemeral=True)
+        return
+    
+    try:
+        load_config()
+        await interaction.response.send_message("✅ Configuration reloaded successfully.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error reloading configuration: {e}", ephemeral=True)
+
+#--------------------------------------------------------------------
+# Tracker Management Commands
+#--------------------------------------------------------------------
+
+trackers_group = app_commands.Group(name="trackers", description="Manage tracking parameters")
+
+@trackers_group.command(name="list", description="List all trackers organized by provider")
+async def trackers_list(interaction: discord.Interaction):
+    """List all trackers organized by provider."""
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You need administrator permissions to use this command.", ephemeral=True)
+        return
+    
+    load_trackers()
+    
+    if not trackers:
+        await interaction.response.send_message("❌ No trackers configured.", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title="Tracking Parameters",
+        description="All configured tracking parameters by provider",
+        color=discord.Color.blue()
+    )
+    
+    # Discord embeds have a limit of 6000 characters total
+    # Split into multiple embeds if needed
+    total_length = 0
+    fields_added = 0
+    
+    for provider, params in sorted(trackers.items()):
+        if not params:
+            continue
+        
+        params_str = ", ".join(params)
+        field_value = f"`{params_str}`"
+        
+        # Check if adding this field would exceed limits
+        # Discord field value limit is 1024 characters, embed total is 6000
+        if len(field_value) > 1024:
+            # Truncate if too long
+            field_value = field_value[:1020] + "..."
+        
+        if total_length + len(field_value) + len(provider) > 5500 or fields_added >= 25:
+            # Add a note that there are more providers
+            embed.add_field(
+                name="...",
+                value=f"*Showing first {fields_added} providers. Use `/trackers list` to see all.*",
+                inline=False
+            )
+            break
+        
+        embed.add_field(
+            name=provider,
+            value=field_value,
+            inline=False
+        )
+        total_length += len(field_value) + len(provider)
+        fields_added += 1
+    
+    embed.set_footer(text=f"Total providers: {len(trackers)}")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@trackers_group.command(name="add", description="Add a tracker parameter to a provider")
+@app_commands.describe(provider="The provider name (e.g., Google, Meta)")
+@app_commands.describe(tracker="The tracker parameter name to add")
+async def trackers_add(interaction: discord.Interaction, provider: str, tracker: str):
+    """Add a tracker parameter to a provider."""
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You need administrator permissions to use this command.", ephemeral=True)
+        return
+    
+    load_trackers()
+    
+    # Normalize provider name (capitalize first letter)
+    provider_normalized = provider.strip()
+    if provider_normalized:
+        provider_normalized = provider_normalized[0].upper() + provider_normalized[1:].lower()
+    
+    tracker_normalized = tracker.strip()
+    
+    if not tracker_normalized:
+        await interaction.response.send_message("❌ Tracker parameter name cannot be empty.", ephemeral=True)
+        return
+    
+    # Check if tracker already exists for any provider
+    tracker_lower = tracker_normalized.lower()
+    existing_provider = None
+    for prov, params in trackers.items():
+        if tracker_lower in [p.lower() for p in params]:
+            existing_provider = prov
+            break
+    
+    if existing_provider:
+        if existing_provider == provider_normalized:
+            await interaction.response.send_message(
+                f"❌ Tracker `{tracker_normalized}` already exists for provider `{provider_normalized}`.",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Tracker `{tracker_normalized}` already exists for provider `{existing_provider}`. "
+                f"Remove it first if you want to add it to `{provider_normalized}`.",
+                ephemeral=True
+            )
+        return
+    
+    # Add tracker to provider
+    if provider_normalized not in trackers:
+        trackers[provider_normalized] = []
+    
+    trackers[provider_normalized].append(tracker_normalized)
+    save_trackers()
+    load_trackers()  # Reload to update PARAM_INDEX
+    
+    await interaction.response.send_message(
+        f"✅ Added tracker `{tracker_normalized}` to provider `{provider_normalized}`.",
+        ephemeral=True
+    )
+
+@trackers_group.command(name="remove", description="Remove a tracker parameter from a provider")
+@app_commands.describe(provider="The provider name (e.g., Google, Meta)")
+@app_commands.describe(tracker="The tracker parameter name to remove")
+async def trackers_remove(interaction: discord.Interaction, provider: str, tracker: str):
+    """Remove a tracker parameter from a provider."""
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ You need administrator permissions to use this command.", ephemeral=True)
+        return
+    
+    load_trackers()
+    
+    # Normalize provider name (capitalize first letter)
+    provider_normalized = provider.strip()
+    if provider_normalized:
+        provider_normalized = provider_normalized[0].upper() + provider_normalized[1:].lower()
+    
+    tracker_normalized = tracker.strip()
+    
+    if provider_normalized not in trackers:
+        await interaction.response.send_message(
+            f"❌ Provider `{provider_normalized}` not found.",
+            ephemeral=True
+        )
+        return
+    
+    # Find and remove tracker (case-insensitive)
+    tracker_lower = tracker_normalized.lower()
+    found = False
+    for i, param in enumerate(trackers[provider_normalized]):
+        if param.lower() == tracker_lower:
+            removed_tracker = trackers[provider_normalized].pop(i)
+            found = True
+            break
+    
+    if not found:
+        await interaction.response.send_message(
+            f"❌ Tracker `{tracker_normalized}` not found for provider `{provider_normalized}`.",
+            ephemeral=True
+        )
+        return
+    
+    # Remove provider if it has no trackers left
+    if not trackers[provider_normalized]:
+        del trackers[provider_normalized]
+        save_trackers()
+        load_trackers()
+        await interaction.response.send_message(
+            f"✅ Removed tracker `{tracker_normalized}` from provider `{provider_normalized}`. "
+            f"Provider `{provider_normalized}` has been removed as it has no trackers left.",
+            ephemeral=True
+        )
+    else:
+        save_trackers()
+        load_trackers()  # Reload to update PARAM_INDEX
+        await interaction.response.send_message(
+            f"✅ Removed tracker `{tracker_normalized}` from provider `{provider_normalized}`.",
+            ephemeral=True
+        )
+
+bot.tree.add_command(trackers_group)
+
+bot.run(bot_token)
