@@ -5,6 +5,8 @@ A Discord bot that automatically removes tracking parameters from URLs in messag
 ## Table of Contents
 
 - [Discord Link Cleaner Bot](#discord-link-cleaner-bot)
+  - [Features](#features)
+  - [Demo](#demo)
   - [Table of Contents](#table-of-contents)
   - [Features](#features)
   - [Prerequisites](#prerequisites)
@@ -42,6 +44,9 @@ A Discord bot that automatically removes tracking parameters from URLs in messag
 - Configurable tracker list via `trackers.json`
 - Supports custom regex patterns for URL detection
 - Optional requirement for messages to contain links before processing
+
+## Demo
+Visit the [Discord Server!](https://discord.gg/BPRdkATNB6)
 
 ## Prerequisites
 
